@@ -2095,15 +2095,12 @@ class SimpleMcpServer:
             ),
             self._tool(
                 "transform.inspect",
-                "Inspect/process transform extraction pipeline.",
+                "Inspect/process transform pipeline. Requires session_id or path.",
                 {
                     "session_id": {"type": "string"},
                     "path": {"type": "string"},
                     "mode": {"type": "string"},
                     "process": {"type": "boolean"},
-                },
-                schema_extra={
-                    "oneOf": [{"required": ["session_id"]}, {"required": ["path"]}],
                 },
             ),
             self._tool(

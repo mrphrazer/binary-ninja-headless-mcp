@@ -133,13 +133,11 @@ def test_transform_inspect_schema_and_validation(real_server: SimpleMcpServer) -
         item for item in listed["result"]["tools"] if item.get("name") == "transform.inspect"
     )
     schema = tool["inputSchema"]
-    one_of = schema.get("oneOf")
-    assert isinstance(one_of, list)
-    required_sets = {
-        tuple(sorted(entry.get("required", []))) for entry in one_of if isinstance(entry, dict)
-    }
-    assert ("session_id",) in required_sets
-    assert ("path",) in required_sets
+    # oneOf removed from top-level schema for Claude API compatibility;
+    # the server-side handler still validates that session_id or path is provided.
+    assert "oneOf" not in schema
+    assert "session_id" in schema["properties"]
+    assert "path" in schema["properties"]
 
     response = real_server.handle_request(
         {
