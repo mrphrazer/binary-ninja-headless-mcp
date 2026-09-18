@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -15,6 +17,10 @@ class FakeSymbol:
 class FakeFunction:
     start: int
     name: str
+
+    @property
+    def llil(self):
+        return SimpleNamespace(instructions=[])
 
     @property
     def symbol(self) -> FakeSymbol:
@@ -54,6 +60,21 @@ class FakeBinaryView:
             FakeStringRef(start=0x1800, length=5, value="hello"),
             FakeStringRef(start=0x1810, length=5, value="world"),
         ]
+        self.analysis_state = "IdleState"
+        self.analysis_is_aborted = False
+        self.workflow = SimpleNamespace(machine=SimpleNamespace(enable=self._enable_analysis))
+
+    def _enable_analysis(self) -> None:
+        self.analysis_is_aborted = False
+
+    def update_analysis_and_wait(self) -> None:
+        self.analysis_is_aborted = False
+
+    def update_analysis(self) -> None:
+        self.update_analysis_and_wait()
+
+    def abort_analysis(self) -> None:
+        self.analysis_is_aborted = True
 
     def search(self, pattern: str, raw: bool = False, limit: int = 50) -> list[tuple[int, bytes]]:  # noqa: ARG002
         if pattern == "hello":
@@ -61,6 +82,21 @@ class FakeBinaryView:
         if pattern == "world":
             return [(0x1810, b"world")][:limit]
         return []
+
+    def create_database(self, path: str) -> bool:
+        Path(path).write_bytes(b"fake-database")
+        return True
+
+    def read(self, address: int, length: int) -> bytes:
+        if not self.start <= address < self.end:
+            return b""
+        return bytes(min(length, self.end - address))
+
+    def get_function_at(self, address: int) -> FakeFunction | None:
+        return next((f for f in self.functions if f.start == address), None)
+
+    def get_functions_containing(self, address: int) -> list[FakeFunction]:
+        return [f for f in self.functions if f.start <= address < f.start + 0x10]
 
     def save(self, dest: str) -> bool:
         _ = dest

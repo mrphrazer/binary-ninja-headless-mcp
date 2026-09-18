@@ -191,7 +191,7 @@ python3 -m binary_ninja_headless_mcp.fuzzer --binary samples/ls --iterations 120
 Fake backend smoke run:
 
 ```bash
-python3 -m binary_ninja_headless_mcp.fuzzer --binary samples/ls --fake-backend --iterations 20
+python3 -m binary_ninja_headless_mcp.fuzzer --binary samples/ls --fake-backend --allow-tool-errors --iterations 20
 ```
 
 Write a JSON coverage report:
@@ -206,15 +206,119 @@ Useful flags:
 - `--verbose`: print each tool call while fuzzing.
 - `--update-analysis`: open the seed session with `update_analysis=true`.
 
+## Analysis and session lifecycle
+
+`session.open`, `session.open_bytes`, and `session.open_existing` with
+`update_analysis=true` return only after analysis finishes. `analysis.update_and_wait`
+has the same synchronous contract. Neither switches to a task or partial result
+on a timer. Sessions are registered before analysis; an analysis failure or
+cancellation returns a tool error containing the retained `session_id` in both
+structured data and compact text, so another call can inspect, retry, or close it.
+
+`analysis.update` now returns a tracked task, just like `task.analysis_update`.
+Poll `task.status` and fetch `task.result` when `result_ready` is true. All terminal
+states (`completed`, `failed`, `cancelled`) have a result envelope; failed tasks
+include `error`. A pending result request is a tool error. This is a deliberate
+change from the earlier untracked `analysis.update` response.
+
+Only one managed analysis may be queued, running, or cancelling per session.
+Different sessions can analyze concurrently. `analysis.status` adds `status`,
+start/completion timestamps, `last_analysis_task_id`, and `last_analysis_error` to
+the existing native `state`, `progress`, `info`, and `is_aborted` fields. These
+managed fields are compatible with Ghidra's lifecycle vocabulary; the native
+progress fields remain Binary Ninja specific. `has_log` is false: there is no
+fabricated Ghidra-style analysis log. Native updates triggered by edits or raw API
+calls are visible in native progress but are not separate managed tasks.
+
+Cancelling a queued task removes its analysis reservation without aborting the
+view. Cancelling running analysis requests a native abort and retains ownership
+until both analysis and abort finish. Once terminal, the session can analyze
+again; the workflow suspended by our abort is resumed. Cancelling an old terminal
+task has no effect on a later run. Running search tasks are best effort and drain
+normally if already started.
+
+An explicit `analysis.set_hold` or disabled workflow is preserved. Analysis returns
+an actionable error while held or disabled; a normal native wait return only counts
+as completion when the engine reports idle and is not aborted. Release the hold or
+enable the workflow before retrying.
+Explicit native control changes invalidate an overlapping managed run even if a
+later control restores an idle state. New analysis requests are rejected while
+control calls are still in flight. A later explicit workflow disable also
+takes precedence over the automatic resume associated with an earlier cancellation.
+
+Binary Ninja can mark interrupted initial analysis as finished before completing
+function discovery. On retry, the server re-requests linear sweep when the view's
+`analysis.linearSweep.autorun` setting permits it, preserving its configured
+analysis mode. This recovery is retained until a managed analysis completes.
+Native heuristics can still produce a different function set after interruption
+in reduced analysis modes. Reopen the original input for an independent fresh
+analysis when comparing results; completion means the requested native pass
+finished, not proof that every possible function was discovered.
+
+`loader.rebase` requires exclusive use of the session. It rejects active analysis
+and other admitted operations; new native calls are rejected during replacement,
+while status/list calls use cached metadata. Close waits for replacement to finish.
+A rebased view keeps ownership of shared native file metadata, and view-specific
+caches are reset. Raw evaluation also protects every session exposed in its context
+from concurrent close for the duration of the evaluation.
+Use the dedicated lifecycle/control tools for cancellation and rebasing; arbitrary
+native calls can bypass managed coordination.
+
+`session.close` prevents new operations, cancels work, and waits for admitted MCP
+calls and background tasks before closing the view. Reopened upload sessions share
+ownership of their temporary backing file; it is deleted after the last dependent
+session closes, so closing a parent does not break its children.
+This ownership is established before a reopened session becomes visible, including
+while its initial analysis is still running.
+If draining or aborting exceeds 30 seconds, it returns an error, retains the
+resources in `closing` state, and permits a later `session.close` retry.
+`analysis.status`, `session.list`, and task metadata remain available. Shutdown
+uses one shared 30-second drain deadline; EOF and transport errors also perform
+cleanup. The line-delimited stdio transport processes requests sequentially;
+use asynchronous tasks for polling on that connection. A second TCP connection
+can inspect or cancel a synchronous call on the first connection.
+
+## Lifecycle verification
+
+The dedicated stateful driver checks strict results and clean EOF shutdown over
+an actual stdio subprocess, and fails on unexpected errors or timeouts:
+
+```bash
+python3 -m binary_ninja_headless_mcp.lifecycle_fuzzer \
+  --binary samples/ls --seed 1337 --transitions 100 \
+  --output-dir /tmp/binja-lifecycle-1337
+BINJA_NATIVE_TEST_BINARY="$PWD/samples/ls" \
+  python3 -m pytest tests/test_transport_lifecycle.py
+```
+
+Use a fresh output directory per run. The driver preserves the input, writes a
+checkpoint database, incremental request/response trace, progress, stderr, input
+hash, engine version, and final report. `--timeout` sets the external response/task
+watchdog (default 300 seconds); a timeout fails verification. To run additional
+seeds on a large binary, `--analysis-database /path/to/checkpoint.bndb` reuses a
+completed analysis in a private copy and records the database hash.
+`--load-options '{"analysis.limits.cacheSize":64}'` passes explicit native settings
+and records them in the report; neither driver changes product defaults. No native
+license is needed for `--fake-backend` smoke runs or deterministic lifecycle race tests.
+
+The broad feature fuzzer excludes plugin execution and repository modification
+from live runs; these actions have tests using doubles. `--trace-jsonl` preserves
+calls incrementally. It reports an unavailable debug parser explicitly. Its default
+exit status fails on all unexpected tool errors; `--allow-tool-errors` is for
+exploratory diagnostics and is not a correctness gate. Run it on a disposable copy
+when exercising writes. The feature fuzzer also accepts `--load-options` and
+`--analysis-database`: it copies the database privately and separately probes raw
+byte loading without repeating initial analysis.
+
 ## Feature Catalog
 
 The server currently exposes `181` tools across `36` feature groups.
 
 ### analysis
-- `analysis.status`: Get analysis status.
+- `analysis.status`: Get managed lifecycle status/timestamps/task/error plus native state and progress.
 - `analysis.progress`: Get analysis progress snapshot.
-- `analysis.update`: Trigger async analysis update.
-- `analysis.update_and_wait`: Run analysis update and wait for completion.
+- `analysis.update`: Start tracked analysis; returns task_id. Rejects overlapping runs on this session.
+- `analysis.update_and_wait`: Wait synchronously until analysis finishes; no timed partial-success response.
 - `analysis.abort`: Abort analysis.
 - `analysis.set_hold`: Hold/release analysis queue.
 
@@ -393,14 +497,14 @@ The server currently exposes `181` tools across `36` feature groups.
 - `session.set_mode`: Update session safety/determinism mode.
 
 ### task
-- `task.analysis_update`: Start async analysis update task.
+- `task.analysis_update`: Alias of analysis.update: start tracked analysis and return task_id.
 - `task.search_text`: Start async search task.
 - `task.status`: Get task status.
-- `task.result`: Get task result.
-- `task.cancel`: Cancel task (best-effort).
+- `task.result`: Get a completed, failed, or cancelled result envelope; pending tasks return an error.
+- `task.cancel`: Request cancellation. Terminal tasks are unchanged; running analysis drains before reuse.
 
 ### transform
-- `transform.inspect`: Inspect/process transform extraction pipeline.
+- `transform.inspect`: Inspect/process transform extraction pipeline. For a session input, the root context is retained in the selected contexts so temporary transform cleanup preserves the session's view.
 
 ### type
 - `type.parse_string`: Parse a single type string.

@@ -128,6 +128,9 @@ def test_analysis_and_navigation_features(
 
     status_after_update = real_backend.analysis_update(session_id, wait=False)
     assert status_after_update["session_id"] == session_id
+    assert (
+        _wait_task_completed(real_backend, status_after_update["task_id"])["status"] == "completed"
+    )
 
     status_after_wait = real_backend.analysis_update(session_id, wait=True)
     assert status_after_wait["session_id"] == session_id
@@ -269,7 +272,8 @@ def test_async_tasks_and_persistence(
     assert completed_analysis["status"] == "completed"
 
     cancel_result = real_backend.task_cancel(search_task_id)
-    assert cancel_result["cancel_requested"] is True
+    assert cancel_result["cancel_requested"] is False
+    assert cancel_result["status"] == "completed"
 
     bndb_path = tmp_path / "hello.bndb"
     created = real_backend.create_database(session_id, str(bndb_path))

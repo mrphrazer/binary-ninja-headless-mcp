@@ -8,15 +8,18 @@ import io
 import os
 import re
 import tempfile
-import threading
 import time
-from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout, suppress
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import fields, is_dataclass
+from itertools import islice
 from types import ModuleType
 from typing import Any
 from uuid import uuid4
+
+from . import lifecycle
+from .lifecycle import BinjaBackendError, LifecycleMixin, SessionRecord, TaskRecord
+
+__all__ = ["BinjaBackend", "BinjaBackendError", "TaskRecord"]
 
 DETERMINISM_ENV_KEYS = (
     "BN_DISABLE_USER_SETTINGS",
@@ -27,36 +30,7 @@ DETERMINISM_ENV_KEYS = (
 MAX_MEMORY_READ_BYTES = 64 * 1024
 
 
-class BinjaBackendError(RuntimeError):
-    """Raised when a backend operation fails."""
-
-
-@dataclass
-class SessionRecord:
-    """Tracks an open BinaryView session."""
-
-    session_id: str
-    view: Any
-    read_only: bool = True
-    deterministic: bool = True
-    temp_path: str | None = None
-    has_byte_edits: bool = False
-
-
-@dataclass
-class TaskRecord:
-    """Tracks an asynchronous task launched by the backend."""
-
-    task_id: str
-    kind: str
-    future: Future[Any]
-    session_id: str | None
-    cancel_hook: Callable[[], None] | None = None
-    cancel_requested: bool = False
-    created_at: float = field(default_factory=time.time)
-
-
-class BinjaBackend:
+class BinjaBackend(LifecycleMixin):
     """High-level Binja operations exposed to MCP tools."""
 
     def __init__(self, bn_module: ModuleType):
@@ -67,11 +41,7 @@ class BinjaBackend:
         self._type_archives: dict[str, Any] = {}
         self._projects: dict[str, Any] = {}
         self._base_detectors: dict[str, Any] = {}
-        self._lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(
-            max_workers=4,
-            thread_name_prefix="binary_ninja_headless_mcp",
-        )
+        self._init_lifecycle()
 
     def ping(self) -> dict[str, str]:
         return {"status": "ok", "message": "pong"}
@@ -85,19 +55,40 @@ class BinjaBackend:
         read_only: bool = True,
         deterministic: bool = True,
     ) -> dict[str, Any]:
+        return self._open_session_path(
+            path,
+            update_analysis=update_analysis,
+            options=options,
+            read_only=read_only,
+            deterministic=deterministic,
+        )
+
+    def _open_session_path(
+        self,
+        path: str,
+        *,
+        update_analysis: bool,
+        options: dict[str, Any] | None,
+        read_only: bool,
+        deterministic: bool,
+        temp_path: str | None = None,
+    ) -> dict[str, Any]:
         if not path:
             raise BinjaBackendError("path is required")
 
         if deterministic:
             self._apply_determinism_env(True)
 
-        view = self._load_view(path, update_analysis=update_analysis, options=options or {})
+        with self._lock:
+            self._ensure_running()
+        view = self._load_view(path, update_analysis=False, options=options or {})
         session_id = self._register_session(
             view,
             read_only=read_only,
             deterministic=deterministic,
+            temp_path=temp_path,
         )
-        return self.binary_summary(session_id)
+        return self._finalize_open(session_id, update_analysis)
 
     def open_session_from_bytes(
         self,
@@ -132,7 +123,7 @@ class BinjaBackend:
         try:
             view = self._load_view(
                 temp_path,
-                update_analysis=update_analysis,
+                update_analysis=False,
                 options=options or {},
             )
         except Exception:
@@ -146,7 +137,7 @@ class BinjaBackend:
             deterministic=deterministic,
             temp_path=temp_path,
         )
-        return self.binary_summary(session_id)
+        return self._finalize_open(session_id, update_analysis)
 
     def open_session_from_existing(
         self,
@@ -157,18 +148,29 @@ class BinjaBackend:
         read_only: bool = True,
         deterministic: bool = True,
     ) -> dict[str, Any]:
-        source_view = self._get_view(source_session_id)
-        source_path = self._safe_attr_chain(source_view, "file.filename")
-        if not source_path:
-            raise BinjaBackendError("source session has no filename to reopen")
+        with self._operation_scope(
+            "session.open_existing", {"source_session_id": source_session_id}
+        ):
+            source = self._get_record(source_session_id)
+            source_path = self._safe_attr_chain(source.view, "file.filename")
+            if not source_path:
+                raise BinjaBackendError("source session has no filename to reopen")
 
-        return self.open_session(
-            source_path,
-            update_analysis=update_analysis,
-            options=options,
-            read_only=read_only,
-            deterministic=deterministic,
-        )
+            # Publish upload ownership together with the new session. Another
+            # client may reopen it before its synchronous analysis has finished.
+            return self._open_session_path(
+                source_path,
+                update_analysis=update_analysis,
+                options=options,
+                read_only=read_only,
+                deterministic=deterministic,
+                temp_path=source.temp_path if source.temp_path == source_path else None,
+            )
+
+    def _finalize_open(self, session_id: str, update_analysis: bool) -> dict[str, Any]:
+        if update_analysis:
+            self.analysis_update_and_wait(session_id)
+        return self.binary_summary(session_id)
 
     def set_session_mode(
         self,
@@ -198,15 +200,7 @@ class BinjaBackend:
         }
 
     def close_session(self, session_id: str) -> dict[str, Any]:
-        record = self._sessions.pop(session_id, None)
-        if record is None:
-            raise BinjaBackendError(f"unknown session_id: {session_id}")
-
-        self._close_view(record.view)
-        if record.temp_path:
-            with suppress(OSError):
-                os.unlink(record.temp_path)
-        return {"closed": True, "session_id": session_id}
+        return self._close_session(session_id, time.monotonic() + lifecycle.CLOSE_DRAIN_TIMEOUT_S)
 
     def _load_view(
         self,
@@ -232,76 +226,126 @@ class BinjaBackend:
         deterministic: bool,
         temp_path: str | None = None,
     ) -> str:
-        session_id = uuid4().hex
-        self._sessions[session_id] = SessionRecord(
-            session_id=session_id,
-            view=view,
-            read_only=read_only,
-            deterministic=deterministic,
-            temp_path=temp_path,
-        )
-        return session_id
+        with self._condition:
+            if not self._shutting_down:
+                session_id = uuid4().hex
+                self._sessions[session_id] = SessionRecord(
+                    session_id=session_id,
+                    view=view,
+                    read_only=read_only,
+                    deterministic=deterministic,
+                    temp_path=temp_path,
+                )
+                self._condition.notify_all()
+                return session_id
+        # A load admitted before shutdown can finish after the session snapshot.
+        # Cleanup outside the global lock so cancellation/status stay responsive.
+        self._close_view(view)
+        if temp_path:
+            with self._lock:
+                shared = any(record.temp_path == temp_path for record in self._sessions.values())
+            if not shared:
+                with suppress(OSError):
+                    os.unlink(temp_path)
+        raise BinjaBackendError("backend is shutting down")
 
     def list_sessions(self) -> dict[str, Any]:
-        return {
-            "sessions": [self.binary_summary(session_id) for session_id in sorted(self._sessions)],
-            "count": len(self._sessions),
-        }
+        with self._operation_scope("session.list", {}) as records:
+            with self._lock:
+                ids = {record.session_id for record in records}
+                summaries = [
+                    {
+                        **record.summary,
+                        "session_id": sid,
+                        "closing": record.closing,
+                        "replacing": record.replacing,
+                    }
+                    for sid, record in sorted(self._sessions.items())
+                    if (record.closing or record.replacing) and sid not in ids
+                ]
+            summaries.extend(self.binary_summary(sid) for sid in sorted(ids))
+        return {"sessions": summaries, "count": len(summaries)}
 
     def binary_summary(self, session_id: str) -> dict[str, Any]:
-        record = self._get_record(session_id)
-        view = record.view
+        with self._lock:
+            record = self._lookup_record(session_id)
+            if record.closing or (record.replacing and not self._owns_replacement(session_id)):
+                return {
+                    **record.summary,
+                    "session_id": session_id,
+                    "closing": record.closing,
+                    "replacing": record.replacing,
+                }
+            record.active_operations += 1
+        try:
+            view = record.view
 
-        filename = self._safe_attr_chain(view, "file.filename")
-        arch = self._safe_attr_chain(view, "arch.name")
+            filename = self._safe_attr_chain(view, "file.filename")
+            arch = self._safe_attr_chain(view, "arch.name")
 
-        return {
-            "session_id": session_id,
-            "filename": filename,
-            "arch": arch,
-            "view_type": self._safe_attr(view, "view_type"),
-            "start": self._hex_or_none(self._safe_attr(view, "start")),
-            "end": self._hex_or_none(self._safe_attr(view, "end")),
-            "entry_point": self._hex_or_none(self._safe_attr(view, "entry_point")),
-            "function_count": self._iter_count(self._safe_attr(view, "functions")),
-            "string_count": self._iter_count(self._safe_attr(view, "strings")),
-            "read_only": record.read_only,
-            "deterministic": record.deterministic,
-        }
+            summary = {
+                "session_id": session_id,
+                "filename": filename,
+                "arch": arch,
+                "view_type": self._safe_attr(view, "view_type"),
+                "start": self._hex_or_none(self._safe_attr(view, "start")),
+                "end": self._hex_or_none(self._safe_attr(view, "end")),
+                "entry_point": self._hex_or_none(self._safe_attr(view, "entry_point")),
+                "function_count": self._iter_count(self._safe_attr(view, "functions")),
+                "string_count": self._iter_count(self._safe_attr(view, "strings")),
+                "read_only": record.read_only,
+                "deterministic": record.deterministic,
+            }
+            with self._lock:
+                record.summary = summary
+            return summary
+        finally:
+            with self._condition:
+                record.active_operations -= 1
+                self._condition.notify_all()
 
     def analysis_update(self, session_id: str, *, wait: bool = False) -> dict[str, Any]:
-        view = self._get_view(session_id)
+        if wait:
+            return self.analysis_update_and_wait(session_id)
+        return self.task_start_analysis_update(session_id)
 
-        try:
-            if wait:
-                view.update_analysis_and_wait()
-            else:
-                view.update_analysis()
-        except Exception as exc:  # pragma: no cover - depends on binaryninja internals
-            raise BinjaBackendError(f"analysis update failed: {exc}") from exc
-
-        return self.analysis_status(session_id)
+    def analysis_update_and_wait(self, session_id: str) -> dict[str, Any]:
+        record, run = self._begin_analysis(session_id)
+        return self._run_analysis(record, run)
 
     def analysis_abort(self, session_id: str) -> dict[str, Any]:
-        view = self._get_view(session_id)
-
-        try:
-            view.abort_analysis()
-        except Exception as exc:  # pragma: no cover - depends on binaryninja internals
-            raise BinjaBackendError(f"failed to abort analysis: {exc}") from exc
-
+        idle_abort = False
+        with self._lock:
+            record = self._get_record(session_id)
+            run = record.active_analysis
+            if run is None:
+                record, run = self._begin_analysis(session_id)
+                run.started = True
+                idle_abort = True
+            task_id = run.task_id
+            if task_id is None:
+                self._request_analysis_cancel(record, run)
+        if task_id is not None:
+            return {
+                **self.task_cancel(task_id),
+                "is_aborted": bool(self._safe_attr(record.view, "analysis_is_aborted")),
+            }
+        if idle_abort:
+            # The reservation covers automatic updates initiated by edits/raw APIs.
+            with suppress(lifecycle.AnalysisCancelled):
+                self._run_analysis(record, run)
         return {
             "session_id": session_id,
-            "is_aborted": bool(self._safe_attr(view, "analysis_is_aborted")),
+            "is_aborted": bool(self._safe_attr(record.view, "analysis_is_aborted")),
+            "cancel_requested": run.cancel_requested,
         }
 
     def analysis_set_hold(self, session_id: str, hold: bool) -> dict[str, Any]:
-        view = self._get_view(session_id)
-
-        try:
-            view.set_analysis_hold(hold)
-        except Exception as exc:  # pragma: no cover - depends on binaryninja internals
-            raise BinjaBackendError(f"failed to set analysis hold: {exc}") from exc
+        with self._analysis_control(session_id, interrupts=hold) as record:
+            try:
+                record.view.set_analysis_hold(hold)
+            except Exception as exc:  # pragma: no cover - depends on binaryninja internals
+                raise BinjaBackendError(f"failed to set analysis hold: {exc}") from exc
 
         return {
             "session_id": session_id,
@@ -309,12 +353,26 @@ class BinjaBackend:
         }
 
     def analysis_status(self, session_id: str) -> dict[str, Any]:
-        view = self._get_view(session_id)
+        with self._condition:
+            record = self._lookup_record(session_id)
+            if record.closing or (record.replacing and not self._owns_replacement(session_id)):
+                return {**record.native_status, **self._managed_status(record)}
+            record.active_operations += 1
+        try:
+            native = self._native_analysis_status(record.view)
+            with self._lock:
+                record.native_status = native
+                return {**native, **self._managed_status(record)}
+        finally:
+            with self._condition:
+                record.active_operations -= 1
+                self._condition.notify_all()
+
+    def _native_analysis_status(self, view: Any) -> dict[str, Any]:
         progress = self._safe_attr(view, "analysis_progress")
         info = self._safe_attr(view, "analysis_info")
 
         return {
-            "session_id": session_id,
             "state": self._enum_name_or_value(self._safe_attr(view, "analysis_state")),
             "is_aborted": bool(self._safe_attr(view, "analysis_is_aborted")),
             "progress": {
@@ -659,14 +717,20 @@ class BinjaBackend:
     ) -> dict[str, Any]:
         self._validate_offset_limit(offset, limit)
         view = self._get_view(session_id)
-        lines = list(self._safe_iter(self._safe_attr(view, "linear_disassembly")))
-        sliced = lines[offset : offset + limit]
-        items = [self._linear_disassembly_line_to_record(line) for line in sliced]
+        items = []
+        total = 0
+        # Preserve the exact total without retaining every native line/token.
+        # Large binaries can have millions of lines even for a tiny page request.
+        for total, line in enumerate(
+            self._safe_iter(self._safe_attr(view, "linear_disassembly")), start=1
+        ):
+            if offset < total <= offset + limit:
+                items.append(self._linear_disassembly_line_to_record(line))
         return {
             "session_id": session_id,
             "offset": offset,
             "limit": limit,
-            "total": len(lines),
+            "total": total,
             "items": items,
         }
 
@@ -688,9 +752,9 @@ class BinjaBackend:
             raise BinjaBackendError("BinaryView.search is not available")
 
         try:
-            matches = list(search(query, raw=True, limit=limit))
+            matches = list(islice(search(query, raw=True, limit=limit), limit))
         except TypeError:
-            matches = list(search(query))
+            matches = list(islice(search(query), limit))
         except Exception as exc:  # pragma: no cover - depends on binaryninja internals
             raise BinjaBackendError(f"search failed: {exc}") from exc
 
@@ -2391,6 +2455,12 @@ class BinjaBackend:
         }
 
     def eval_code(self, code: str, *, session_id: str | None = None) -> dict[str, Any]:
+        with self._operation_scope("binja.eval", {"session_id": session_id}) as records:
+            return self._eval_code(code, session_id=session_id, records=records)
+
+    def _eval_code(
+        self, code: str, *, session_id: str | None, records: list[SessionRecord]
+    ) -> dict[str, Any]:
         if not code:
             raise BinjaBackendError("code is required")
 
@@ -2398,12 +2468,12 @@ class BinjaBackend:
             _ = self._get_view(session_id)
             transition_candidates = [session_id]
         else:
-            transition_candidates = sorted(self._sessions)
+            transition_candidates = sorted(record.session_id for record in records)
         transitioned_session_ids = self._transition_sessions_to_writable(transition_candidates)
 
         context: dict[str, Any] = {
             "bn": self._bn,
-            "sessions": {session_id: record.view for session_id, record in self._sessions.items()},
+            "sessions": {record.session_id: record.view for record in records},
         }
         if session_id is not None:
             context["bv"] = self._get_view(session_id)
@@ -2432,17 +2502,19 @@ class BinjaBackend:
         return payload
 
     def task_start_analysis_update(self, session_id: str) -> dict[str, Any]:
-        _ = self._get_view(session_id)
-
-        def run() -> dict[str, Any]:
-            return self.analysis_update(session_id, wait=True)
-
-        return self._submit_task(
-            kind="analysis.update_and_wait",
-            session_id=session_id,
-            func=run,
-            cancel_hook=lambda: self.analysis_abort(session_id),
-        )
+        record, run = self._begin_analysis(session_id)
+        try:
+            return self._submit_task(
+                kind="analysis.update_and_wait",
+                session_id=session_id,
+                func=lambda: self._run_analysis(record, run),
+                analysis_run=run,
+            )
+        except Exception as exc:
+            self._finish_analysis(record, run, "failed", str(exc))
+            raise BinjaBackendError(
+                f"failed to submit analysis task: {exc}", session_id=session_id, status="failed"
+            ) from exc
 
     def task_start_search_text(
         self,
@@ -2459,74 +2531,43 @@ class BinjaBackend:
         return self._submit_task(kind="binary.search_text", session_id=session_id, func=run)
 
     def task_status(self, task_id: str) -> dict[str, Any]:
-        record = self._get_task(task_id)
-
-        status = self._task_status_value(record)
-        payload: dict[str, Any] = {
-            "task_id": record.task_id,
-            "kind": record.kind,
-            "session_id": record.session_id,
-            "status": status,
-            "cancel_requested": record.cancel_requested,
-            "cancel_supported": record.cancel_hook is not None,
-            "created_at": record.created_at,
-        }
-
-        if record.future.done() and not record.future.cancelled():
-            exception = record.future.exception()
-            if exception is not None:
-                payload["error"] = str(exception)
-            else:
-                payload["result_ready"] = True
-
-        return payload
+        with self._lock:
+            record = self._get_task(task_id)
+            status = self._task_status_value(record)
+            error = record.future.exception() if status == "failed" else None
+            return {
+                "task_id": record.task_id,
+                "kind": record.kind,
+                "session_id": record.session_id,
+                "status": status,
+                "cancel_requested": record.cancel_requested,
+                "cancel_supported": record.analysis_run is not None
+                or record.cancel_hook is not None,
+                "result_ready": status in lifecycle.TERMINAL_STATES,
+                "error": str(error) if error is not None else None,
+                "created_at": record.created_at,
+            }
 
     def task_result(self, task_id: str) -> dict[str, Any]:
-        record = self._get_task(task_id)
-        status = self._task_status_value(record)
-
-        if status != "completed":
-            raise BinjaBackendError(f"task is not completed (status={status})")
-
-        try:
-            result = record.future.result()
-        except Exception as exc:  # pragma: no cover - depends on task internals
-            raise BinjaBackendError(f"task failed: {exc}") from exc
-
-        return {
-            "task_id": record.task_id,
-            "kind": record.kind,
-            "session_id": record.session_id,
-            "status": status,
-            "result": self._to_jsonable(result),
-        }
+        with self._lock:
+            record = self._get_task(task_id)
+            status = self._task_status_value(record)
+            if status not in lifecycle.TERMINAL_STATES:
+                raise BinjaBackendError(f"task is not in a terminal state (status={status})")
+            payload = {
+                "task_id": task_id,
+                "kind": record.kind,
+                "session_id": record.session_id,
+                "status": status,
+            }
+            if status == "failed":
+                payload["error"] = str(record.future.exception())
+            elif status == "completed":
+                payload["result"] = self._to_jsonable(record.future.result())
+            return payload
 
     def task_cancel(self, task_id: str) -> dict[str, Any]:
-        record = self._get_task(task_id)
-        record.cancel_requested = True
-
-        future_cancelled = record.future.cancel()
-        cancel_hook_called = False
-
-        if record.cancel_hook is not None:
-            try:
-                record.cancel_hook()
-            except Exception:
-                cancel_hook_called = False
-            else:
-                cancel_hook_called = True
-
-        status = self._task_status_value(record)
-
-        return {
-            "task_id": record.task_id,
-            "kind": record.kind,
-            "session_id": record.session_id,
-            "cancel_requested": True,
-            "future_cancelled": future_cancelled,
-            "cancel_hook_called": cancel_hook_called,
-            "status": status,
-        }
+        return self._cancel_task(task_id)
 
     def create_database(self, session_id: str, path: str) -> dict[str, Any]:
         if not path:
@@ -3384,7 +3425,7 @@ class BinjaBackend:
             "is_function_machine": bool(self._safe_attr(machine, "is_function_machine")),
         }
 
-    def workflow_machine_control(  # noqa: PLR0912
+    def workflow_machine_control(
         self,
         session_id: str,
         action: str,
@@ -3396,12 +3437,66 @@ class BinjaBackend:
         activity: str | None = None,
         enable: bool | None = None,
     ) -> dict[str, Any]:
+        with self._analysis_control(session_id, interrupts=False):
+            return self._workflow_machine_control(
+                session_id,
+                action,
+                workflow_name=workflow_name,
+                advanced=advanced,
+                incremental=incremental,
+                activities=activities,
+                activity=activity,
+                enable=enable,
+            )
+
+    def _workflow_machine_control(  # noqa: PLR0912
+        self,
+        session_id: str,
+        action: str,
+        *,
+        workflow_name: str | None,
+        advanced: bool,
+        incremental: bool,
+        activities: list[str] | str | None,
+        activity: str | None,
+        enable: bool | None,
+    ) -> dict[str, Any]:
         workflow = self._resolve_workflow(session_id, workflow_name)
         machine = self._safe_attr(workflow, "machine")
         if machine is None:
             raise BinjaBackendError("workflow machine is not available")
 
         normalized_action = action.lower()
+        actions = {
+            "run",
+            "resume",
+            "halt",
+            "reset",
+            "enable",
+            "disable",
+            "dump",
+            "breakpoint_set",
+            "breakpoint_delete",
+            "override_set",
+            "override_clear",
+        }
+        if normalized_action not in actions:
+            raise BinjaBackendError("action must be one of: " + ", ".join(sorted(actions)))
+        if normalized_action == "override_set" and (activity is None or enable is None):
+            raise BinjaBackendError(
+                "activity and enable are required for workflow machine override_set"
+            )
+        if normalized_action == "override_clear" and activity is None:
+            raise BinjaBackendError("activity is required for workflow machine override_clear")
+        if normalized_action != "dump":
+            with self._lock:
+                record = self._get_record(session_id)
+                record.control_generation += 1
+                if normalized_action in {"run", "resume", "halt", "reset", "enable", "disable"}:
+                    record.resume_generation += 1
+                    record.resume_after_abort = False
+            if normalized_action in {"disable", "halt", "reset"}:
+                self._note_initial_interruption(record)
         try:
             if normalized_action == "run":
                 machine.run(advanced=advanced, incremental=incremental)
@@ -3422,22 +3517,9 @@ class BinjaBackend:
             elif normalized_action == "breakpoint_delete":
                 machine.breakpoint_delete(activities or [])
             elif normalized_action == "override_set":
-                if activity is None or enable is None:
-                    raise BinjaBackendError(
-                        "activity and enable are required for workflow machine override_set"
-                    )
                 machine.override_set(activity, enable)
             elif normalized_action == "override_clear":
-                if activity is None:
-                    raise BinjaBackendError(
-                        "activity is required for workflow machine override_clear"
-                    )
                 machine.override_clear(activity)
-            else:
-                raise BinjaBackendError(
-                    "action must be one of: run, resume, halt, reset, enable, disable, dump, "
-                    "breakpoint_set, breakpoint_delete, override_set, override_clear"
-                )
         except BinjaBackendError:
             raise
         except Exception as exc:
@@ -3573,7 +3655,7 @@ class BinjaBackend:
             "parsed": self._to_jsonable(parsed),
         }
 
-    def uidf_set_user_var_value(
+    def uidf_set_user_var_value(  # noqa: PLR0917 - preserve the existing backend API
         self,
         session_id: str,
         function_start: int | str,
@@ -3702,6 +3784,12 @@ class BinjaBackend:
         *,
         force: bool = False,
     ) -> dict[str, Any]:
+        with self._exclusive_session(session_id):
+            return self._rebase_session(session_id, address, force=force)
+
+    def _rebase_session(
+        self, session_id: str, address: int | str, *, force: bool
+    ) -> dict[str, Any]:
         self._require_writable_session(
             session_id,
             "session is read-only; switch to write mode before rebasing",
@@ -3752,9 +3840,25 @@ class BinjaBackend:
             raise BinjaBackendError(f"failed to rebase view: {exc}") from exc
 
         if rebased is not None and rebased is not view:
+            shared_file = view.file == rebased.file
             record.view = rebased
-            self._close_view(view)
+            # Native rebase returns a new view sharing its FileMetadata. Closing
+            # that file would also abort/invalidate the replacement view.
+            if not shared_file:
+                self._close_view(view)
             view = rebased
+            self._base_detectors.pop(session_id, None)
+            record.native_status = self._native_analysis_status(view)
+            record.resume_after_abort = (
+                record.resume_after_abort and shared_file and record.native_status["is_aborted"]
+            )
+            record.last_analysis_status = "idle"
+            record.last_analysis_started_at = None
+            record.last_analysis_completed_at = None
+            record.last_analysis_task_id = None
+            record.last_analysis_error = None
+            record.summary = {}
+            self.binary_summary(session_id)
 
         return {
             "session_id": session_id,
@@ -4260,12 +4364,16 @@ class BinjaBackend:
         mode_value = self._resolve_transform_mode(mode)
         try:
             session = self._bn.TransformSession(target, mode=mode_value)
+            root_context = session.root_context
+            if session_id is not None and root_context is not None:
+                # Unselected transform contexts close their input when freed.
+                # This view belongs to the MCP session, including on failure.
+                session.set_selected_contexts(root_context)
             if process:
                 session.process()
         except Exception as exc:
             raise BinjaBackendError(f"failed to create/process transform session: {exc}") from exc
 
-        root_context = self._safe_attr(session, "root_context")
         current_view = self._safe_attr(session, "current_view")
         try:
             selected = list(self._safe_iter(self._safe_attr(session, "selected_contexts")))
@@ -4816,65 +4924,7 @@ class BinjaBackend:
         }
 
     def shutdown(self) -> None:
-        for record in self._sessions.values():
-            self._close_view(record.view)
-            if record.temp_path:
-                with suppress(OSError):
-                    os.unlink(record.temp_path)
-        self._sessions.clear()
-        self._base_detectors.clear()
-        self._type_libraries.clear()
-        self._type_archives.clear()
-
-        for project in self._projects.values():
-            with suppress(Exception):
-                project.close()
-        self._projects.clear()
-
-        with self._lock:
-            tasks = list(self._tasks.values())
-
-        for task in tasks:
-            task.future.cancel()
-            if task.cancel_hook is not None:
-                with suppress(Exception):
-                    task.cancel_hook()
-
-        self._executor.shutdown(wait=False, cancel_futures=True)
-
-    def _submit_task(
-        self,
-        *,
-        kind: str,
-        session_id: str | None,
-        func: Callable[[], Any],
-        cancel_hook: Callable[[], None] | None = None,
-    ) -> dict[str, Any]:
-        task_id = uuid4().hex
-        future = self._executor.submit(func)
-        record = TaskRecord(
-            task_id=task_id,
-            kind=kind,
-            future=future,
-            session_id=session_id,
-            cancel_hook=cancel_hook,
-        )
-
-        with self._lock:
-            self._tasks[task_id] = record
-
-        return self.task_status(task_id)
-
-    def _task_status_value(self, record: TaskRecord) -> str:
-        future = record.future
-
-        if future.cancelled():
-            return "cancelled"
-        if future.done():
-            return "failed" if future.exception() is not None else "completed"
-        if future.running():
-            return "cancelling" if record.cancel_requested else "running"
-        return "queued"
+        self._shutdown()
 
     def _resolve_call_target(self, target: str, session_id: str | None) -> tuple[Any, str]:
         if target.startswith("bn."):
@@ -4899,21 +4949,8 @@ class BinjaBackend:
             obj = getattr(obj, part)
         return obj
 
-    def _get_record(self, session_id: str) -> SessionRecord:
-        record = self._sessions.get(session_id)
-        if record is None:
-            raise BinjaBackendError(f"unknown session_id: {session_id}")
-        return record
-
     def _get_view(self, session_id: str) -> Any:
         return self._get_record(session_id).view
-
-    def _get_task(self, task_id: str) -> TaskRecord:
-        with self._lock:
-            task = self._tasks.get(task_id)
-        if task is None:
-            raise BinjaBackendError(f"unknown task_id: {task_id}")
-        return task
 
     def _register_type_library(self, library: Any) -> str:
         for type_library_id, candidate in self._type_libraries.items():
@@ -5503,6 +5540,8 @@ class BinjaBackend:
         else:
             raise BinjaBackendError("level must be one of: llil, mlil, hlil")
 
+        if il is None:
+            raise BinjaBackendError(f"{normalized_level} is not available for this function")
         if ssa:
             ssa_form = getattr(il, "ssa_form", None)
             if ssa_form is None:

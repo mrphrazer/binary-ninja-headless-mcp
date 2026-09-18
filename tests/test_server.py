@@ -563,7 +563,8 @@ def test_task_and_database_tools(
         {"task_id": task_search_id},
         request_id=64,
     )
-    assert cancel_result["structuredContent"]["cancel_requested"] is True
+    assert cancel_result["structuredContent"]["cancel_requested"] is False
+    assert cancel_result["structuredContent"]["status"] == "completed"
 
     bndb_path = tmp_path / "hello-server.bndb"
     created = _call_tool(

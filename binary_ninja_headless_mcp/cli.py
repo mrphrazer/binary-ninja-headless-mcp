@@ -53,14 +53,16 @@ def main(argv: list[str] | None = None) -> int:
     backend = BinjaBackend(bn_module)
     server = SimpleMcpServer(backend)
 
-    if args.transport == "tcp":
-        print(
-            f"binary_ninja_headless_mcp listening on tcp://{args.host}:{args.port}",
-            file=sys.stderr,
-            flush=True,
-        )
-        server.serve_tcp(args.host, args.port)
+    try:
+        if args.transport == "tcp":
+            print(
+                f"binary_ninja_headless_mcp listening on tcp://{args.host}:{args.port}",
+                file=sys.stderr,
+                flush=True,
+            )
+            server.serve_tcp(args.host, args.port)
+        else:
+            server.serve_stdio()
         return 0
-
-    server.serve_stdio()
-    return 0
+    finally:
+        backend.shutdown()

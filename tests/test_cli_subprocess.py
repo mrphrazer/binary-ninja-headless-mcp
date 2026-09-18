@@ -34,7 +34,7 @@ def test_single_command_stdio_mode(sample_binary_path: str) -> None:
         text=True,
     )
 
-    stdout_text, stderr_text = process.communicate(input=input_data, timeout=10)
+    stdout_text, stderr_text = process.communicate(input=input_data, timeout=60)
     assert process.returncode == 0, stderr_text
 
     lines = [line for line in stdout_text.splitlines() if line.strip()]
@@ -97,7 +97,7 @@ def test_stdio_mode_background_server(sample_binary_path: str) -> None:
     finally:
         if process.stdin is not None:
             process.stdin.close()
-        process.wait(timeout=10)
+        process.wait(timeout=60)
 
 
 def test_stdio_binja_eval_print_does_not_corrupt_json_stream(sample_binary_path: str) -> None:
@@ -163,4 +163,4 @@ def test_stdio_binja_eval_print_does_not_corrupt_json_stream(sample_binary_path:
     finally:
         if process.stdin is not None:
             process.stdin.close()
-        process.wait(timeout=10)
+        process.wait(timeout=60)

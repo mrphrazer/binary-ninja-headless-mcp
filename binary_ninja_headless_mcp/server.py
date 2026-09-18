@@ -22,6 +22,9 @@ class JsonRpcError(Exception):
 
 class _ThreadingTcpServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
+    # Idle clients must not block CLI's finally block. Backend shutdown explicitly
+    # drains admitted native operations before the process releases their views.
+    daemon_threads = True
 
 
 class SimpleMcpServer:
@@ -439,10 +442,11 @@ class SimpleMcpServer:
             raise JsonRpcError(code=-32601, message=f"Tool not found: {name}")
 
         try:
-            payload = handler(arguments)
-            return self._tool_result(payload)
+            with self._backend._operation_scope(name, arguments):
+                payload = handler(arguments)
+                return self._tool_result(payload)
         except BinjaBackendError as exc:
-            return self._tool_result({"error": str(exc)}, is_error=True)
+            return self._tool_result({"error": str(exc), **exc.details}, is_error=True)
         except Exception as exc:
             return self._tool_result(
                 {"error": f"unexpected tool failure: {type(exc).__name__}: {exc}"},
@@ -472,9 +476,11 @@ class SimpleMcpServer:
     def _tool_summary_text(payload: dict[str, Any], *, is_error: bool) -> str:
         if is_error:
             error = payload.get("error")
-            if isinstance(error, str) and error:
-                return f"error: {error}"
-            return "error"
+            parts = [f"error: {error}" if isinstance(error, str) and error else "error"]
+            for key in ("session_id", "task_id", "status"):
+                if payload.get(key) is not None:
+                    parts.append(f"{key}={payload[key]}")
+            return " ".join(parts)
 
         keys = (
             "session_id",
@@ -604,7 +610,7 @@ class SimpleMcpServer:
             ),
             self._tool(
                 "analysis.status",
-                "Get analysis status.",
+                "Get lifecycle status, timestamps, task and error, plus native state/progress.",
                 {"session_id": {"type": "string"}},
                 ["session_id"],
             ),
@@ -616,13 +622,13 @@ class SimpleMcpServer:
             ),
             self._tool(
                 "analysis.update",
-                "Trigger async analysis update.",
+                "Start tracked analysis and return task_id; reject overlap on this session.",
                 {"session_id": {"type": "string"}},
                 ["session_id"],
             ),
             self._tool(
                 "analysis.update_and_wait",
-                "Run analysis update and wait for completion.",
+                "Wait synchronously until analysis finishes; no timed partial-success response.",
                 {"session_id": {"type": "string"}},
                 ["session_id"],
             ),
@@ -1514,7 +1520,7 @@ class SimpleMcpServer:
             ),
             self._tool(
                 "task.analysis_update",
-                "Start async analysis update task.",
+                "Alias of analysis.update: start tracked analysis and return task_id.",
                 {"session_id": {"type": "string"}},
                 ["session_id"],
             ),
@@ -1536,13 +1542,13 @@ class SimpleMcpServer:
             ),
             self._tool(
                 "task.result",
-                "Get task result.",
+                "Get terminal result (completed/failed/cancelled); pending tasks return an error.",
                 {"task_id": {"type": "string"}},
                 ["task_id"],
             ),
             self._tool(
                 "task.cancel",
-                "Cancel task (best-effort).",
+                "Cancel pending/running work. Terminal tasks are unchanged; drain before reuse.",
                 {"task_id": {"type": "string"}},
                 ["task_id"],
             ),
@@ -2490,7 +2496,7 @@ class SimpleMcpServer:
 
     def _tool_analysis_update_and_wait(self, arguments: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_str(arguments, "session_id")
-        return self._backend.analysis_update(session_id, wait=True)
+        return self._backend.analysis_update_and_wait(session_id)
 
     def _tool_analysis_abort(self, arguments: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_str(arguments, "session_id")

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import random
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -56,6 +58,12 @@ RANDOM_EXCLUDED_TOOLS = {
     "type_archive.open",
     "type_library.create",
     "type_library.load",
+}
+
+EXTERNAL_ACTION_TOOLS = {
+    "plugin.execute",
+    "plugin_repo.check_updates",
+    "plugin_repo.plugin_action",
 }
 
 _MISSING = object()
@@ -191,28 +199,50 @@ class McpFeatureFuzzer:
         seed: int,
         update_analysis: bool,
         verbose: bool,
+        trace_path: Path | None = None,
+        load_options: dict[str, Any] | None = None,
+        analysis_database: Path | None = None,
     ):
         self._client = LocalMcpClient(server)
+        self._source_hashes = {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(Path(__file__).parent.glob("*.py"))
+        }
         self._rng = random.Random(seed)
         self._iterations = max(iterations, 0)
         self._seed = seed
         self._update_analysis = update_analysis
         self._verbose = verbose
+        self._trace_path = trace_path
+        self._load_options = dict(load_options or {})
+        if trace_path is not None:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self._task_states: dict[str, str] = {}
+        self._unavailable_calls: list[dict[str, str]] = []
         self._stats: dict[str, ToolStats] = {}
         self._attempted_tools: set[str] = set()
         self._successful_tools: set[str] = set()
         self._counter = 0
-        self._temporary_directory = tempfile.TemporaryDirectory(prefix="binja-mcp-fuzzer-")
+        self._work_dir = Path(
+            tempfile.mkdtemp(
+                prefix="binja-mcp-fuzzer-",
+                dir=trace_path.parent if trace_path else None,
+            )
+        )
 
+        self._analysis_database = None
+        if analysis_database is not None:
+            self._analysis_database = self._work_dir / "seed.bndb"
+            shutil.copy2(analysis_database, self._analysis_database)
         sample_data_b64 = base64.b64encode(binary_path.read_bytes()).decode("ascii")
         self._state = FuzzState(
             sample_path=binary_path,
             sample_data_b64=sample_data_b64,
-            work_dir=Path(self._temporary_directory.name),
+            work_dir=self._work_dir,
         )
 
     def close(self) -> None:
-        self._temporary_directory.cleanup()
+        shutil.rmtree(self._work_dir, ignore_errors=True)
 
     def run(self) -> dict[str, Any]:
         self._client.call("initialize", {})
@@ -227,11 +257,15 @@ class McpFeatureFuzzer:
 
         ordered_tools = self._ordered_tool_names(tools_by_name)
         for tool_name in ordered_tools:
+            if tool_name in EXTERNAL_ACTION_TOOLS or tool_name in self._attempted_tools:
+                continue
             tool_def = tools_by_name[tool_name]
             args = self._build_arguments(tool_name, tool_def, fuzz=False)
             self._invoke(tool_name, args)
 
         for tool_name in ordered_tools:
+            if tool_name in EXTERNAL_ACTION_TOOLS:
+                continue
             if tool_name in self._attempted_tools:
                 continue
             tool_def = tools_by_name[tool_name]
@@ -241,7 +275,9 @@ class McpFeatureFuzzer:
         random_tools = [
             name
             for name in ordered_tools
-            if name not in HEAVY_RANDOM_TOOLS and name not in RANDOM_EXCLUDED_TOOLS
+            if name not in HEAVY_RANDOM_TOOLS
+            and name not in RANDOM_EXCLUDED_TOOLS
+            and name not in EXTERNAL_ACTION_TOOLS
         ]
         for _ in range(self._iterations):
             if not random_tools:
@@ -272,6 +308,9 @@ class McpFeatureFuzzer:
             "binary.data_vars",
             "arch.info",
             "function.variables",
+            "function.var_refs",
+            "value.flags_at",
+            "value.possible",
             "workflow.describe",
             "loader.load_settings_types",
             "plugin.valid_commands",
@@ -281,6 +320,10 @@ class McpFeatureFuzzer:
             "type_library.create",
             "type_archive.create",
             "project.create",
+            "project.create_folder",
+            "baseaddr.detect",
+            "database.create_bndb",
+            "database.write_global",
             "task.search_text",
             "task.analysis_update",
         ]
@@ -298,10 +341,11 @@ class McpFeatureFuzzer:
             self._invoke(
                 "session.open",
                 {
-                    "path": str(self._state.sample_path),
+                    "path": str(self._analysis_database or self._state.sample_path),
                     "read_only": False,
                     "deterministic": True,
                     "update_analysis": self._update_analysis,
+                    "options": self._load_options,
                 },
             )
 
@@ -405,6 +449,15 @@ class McpFeatureFuzzer:
         self._stabilize_known_tasks(max_rounds=6)
 
     def _deferred_cleanup(self) -> None:
+        # Rebase a fresh original view: a .bndb view may legitimately refuse it.
+        self._invoke(
+            "session.open",
+            {
+                "path": str(self._state.sample_path),
+                "read_only": False,
+                "update_analysis": False,
+            },
+        )
         if self._state.active_session_id is not None:
             self._invoke(
                 "loader.rebase",
@@ -422,22 +475,41 @@ class McpFeatureFuzzer:
             self._invoke("session.close", {"session_id": session_id})
 
     def _stabilize_known_tasks(self, *, max_rounds: int) -> None:
-        for _ in range(max_rounds):
-            if not self._state.task_ids:
+        # Retain the argument for callers of the old exploratory harness. A fixed
+        # number of polls is not a completion criterion for native analysis.
+        _ = max_rounds
+        deadline = time.monotonic() + 300
+        while True:
+            pending = []
+            for task_id in sorted(self._state.task_ids):
+                is_error, payload, _text = self._client.call_tool(
+                    "task.status", {"task_id": task_id}
+                )
+                if is_error:
+                    raise RuntimeError(f"cannot inspect task {task_id}: {payload}")
+                status = payload.get("status")
+                self._task_states[task_id] = status
+                if status not in {"completed", "failed", "cancelled"}:
+                    pending.append(task_id)
+                elif status == "failed":
+                    raise RuntimeError(f"background task failed: {payload}")
+            if not pending:
                 return
-            statuses = []
-            for task_id in list(self._state.task_ids):
-                self._invoke("task.status", {"task_id": task_id})
-                last = self._stats.get("task.status")
-                if last and last.attempts:
-                    statuses.append(task_id)
-            if not statuses:
-                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"tasks failed to finish within 300 seconds: {pending}")
             time.sleep(0.05)
 
+    def _trace(self, event: dict[str, Any]) -> None:
+        if self._trace_path is not None:
+            with self._trace_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, sort_keys=True) + "\n")
+
     def _invoke(self, tool_name: str, arguments: dict[str, Any]) -> None:
+        self._trace(
+            {"event": "request", "tool": tool_name, "arguments": arguments, "time": time.time()}
+        )
         if self._verbose:
-            print(f"[fuzzer] calling {tool_name}")
+            print(f"[fuzzer] calling {tool_name}", flush=True)
 
         self._attempted_tools.add(tool_name)
         stats = self._stats.setdefault(tool_name, ToolStats())
@@ -446,33 +518,85 @@ class McpFeatureFuzzer:
         try:
             is_error, payload, text = self._client.call_tool(tool_name, arguments)
         except Exception as exc:  # pragma: no cover - network/serialization edge cases
+            self._trace({"event": "exception", "tool": tool_name, "error": str(exc)})
             stats.errors += 1
             stats.last_error = f"json-rpc failure: {type(exc).__name__}: {exc}"
             return
 
+        self._trace(
+            {
+                "event": "response",
+                "tool": tool_name,
+                "is_error": is_error,
+                "payload": payload,
+                "time": time.time(),
+            }
+        )
         if is_error:
             stats.errors += 1
             error_text = payload.get("error") if isinstance(payload.get("error"), str) else text
             stats.last_error = error_text or "tool call returned isError=true"
+            if (
+                tool_name == "debug.parse_and_apply"
+                and error_text == "no debug info parser is available for this view"
+            ):
+                self._unavailable_calls.append({"tool": tool_name, "reason": error_text})
             return
 
         stats.successes += 1
         self._successful_tools.add(tool_name)
         self._update_state(tool_name, arguments, payload)
+        if tool_name in {"analysis.update", "task.analysis_update"}:
+            self._stabilize_known_tasks(max_rounds=0)
+        if tool_name == "analysis.abort":
+            # Restore analysis before testing IL and mutation tools on this view.
+            self._invoke("analysis.update_and_wait", {"session_id": arguments["session_id"]})
+        if tool_name == "analysis.set_hold" and arguments.get("hold"):
+            self._client.call_tool(
+                "analysis.set_hold",
+                {
+                    "session_id": arguments["session_id"],
+                    "hold": False,
+                },
+            )
 
     def _update_state(  # noqa: PLR0912, PLR0915
         self, tool_name: str, arguments: dict[str, Any], payload: dict[str, Any]
     ) -> None:
+        if tool_name == "session.open_bytes" and self._analysis_database is not None:
+            # This unanalysed probe must not pollute the active view's address pool.
+            self._state.session_ids.add(payload["session_id"])
+            self._invoke("session.close", {"session_id": payload["session_id"]})
+            return
         self._collect_ids_and_addresses(payload)
 
-        if tool_name == "session.open" and isinstance(payload.get("session_id"), str):
+        if tool_name == "session.close":
+            sid = arguments["session_id"]
+            self._state.session_ids.discard(sid)
+            if self._state.active_session_id == sid:
+                self._state.active_session_id = None
+        if tool_name in {"session.open", "session.open_bytes", "session.open_existing"}:
+            previous = self._state.active_session_id
+            self._state.session_ids.add(payload["session_id"])
             self._state.active_session_id = payload["session_id"]
-            path_value = arguments.get("path")
+            if previous and previous != payload["session_id"]:
+                self._invoke("session.close", {"session_id": previous})
+            path_value = arguments.get("path", payload.get("filename", ""))
             if isinstance(path_value, str) and path_value.endswith(".bndb"):
                 self._state.database_session_ids.add(payload["session_id"])
-
-        if tool_name == "session.open_existing" and isinstance(payload.get("session_id"), str):
-            self._state.active_session_id = payload["session_id"]
+            # Addresses/variables belong to this view, not previously opened views.
+            # In particular, a saved database may reopen at a different load base.
+            for values in (
+                self._state.addresses,
+                self._state.symbol_addresses,
+                self._state.function_starts,
+                self._state.variable_names,
+            ):
+                values.clear()
+            self._state.start_address = None
+            self._state.end_address = None
+            for name in ("binary.summary", "binary.functions", "binary.symbols"):
+                self._invoke(name, {"session_id": payload["session_id"]})
 
         if tool_name == "binary.summary":
             start = self._as_int(payload.get("start"))
@@ -623,8 +747,6 @@ class McpFeatureFuzzer:
     ) -> None:
         if isinstance(value, dict):
             for child_key, child_value in value.items():
-                if child_key == "session_id" and isinstance(child_value, str):
-                    self._state.session_ids.add(child_value)
                 if child_key == "task_id" and isinstance(child_value, str):
                     self._state.task_ids.add(child_value)
                 if child_key == "project_id" and isinstance(child_value, str):
@@ -708,12 +830,126 @@ class McpFeatureFuzzer:
             arguments.setdefault("read_only", False)
             arguments.setdefault("deterministic", True)
             arguments.setdefault("update_analysis", self._update_analysis)
+            if self._load_options:
+                arguments["options"] = self._load_options
+            if tool_name == "session.open_bytes" and self._analysis_database is not None:
+                arguments["update_analysis"] = False
 
         if tool_name == "session.set_mode":
             arguments.setdefault("read_only", False)
 
         if tool_name == "plugin.execute":
             arguments.setdefault("perform", False)
+        if tool_name == "external.location_add":
+            arguments.setdefault("target_symbol", "mcp_fuzz_external")
+        if tool_name == "annotation.define_data_var":
+            arguments["type_name"] = "char"
+        if tool_name in {"annotation.rename_data_var", "data.typed_at"}:
+            error, variables, _ = self._client.call_tool(
+                "binary.data_vars",
+                {
+                    "session_id": self._pick_session_id(),
+                    "limit": 1,
+                },
+            )
+            if not error and variables.get("items"):
+                arguments["address"] = variables["items"][0]["address"]
+        if tool_name in {"annotation.rename_symbol", "annotation.undefine_symbol"}:
+            arguments["address"] = self._pick_address(prefer_symbol=True)
+        if tool_name == "baseaddr.detect":
+            # Bound this unrelated native heuristic during broad catalog coverage.
+            # Lifecycle fuzzing separately runs the normal full analysis pipeline.
+            base = self._pick_start_address()
+            arguments.update(
+                analysis="basic",
+                low_boundary=base,
+                high_boundary=base + 0x10000,
+                alignment=4096,
+                max_pointers=16,
+            )
+        if tool_name.startswith("workflow.machine."):
+            # A cloned definition has no machine; control the session's bound workflow.
+            arguments.pop("workflow_name", None)
+        if tool_name == "transform.inspect":
+            arguments.setdefault("session_id", self._pick_session_id())
+        if tool_name.startswith("value.") and "function_start" in arguments:
+            arguments["address"] = arguments["function_start"]
+        addressed_il = tool_name == "binary.get_function_il_at"
+        needs_il = addressed_il or (
+            "function_start" in arguments
+            and (
+                tool_name.startswith(("il.", "function.ssa_"))
+                or tool_name
+                in {
+                    "value.flags_at",
+                    "value.possible",
+                    "uidf.set_user_var_value",
+                    "uidf.clear_user_var_value",
+                }
+            )
+        )
+        if needs_il:
+            # Earlier mutation tools can invalidate IL and schedule native updates.
+            # Establish the prerequisite before choosing a function to query/rewrite.
+            self._invoke("analysis.update_and_wait", {"session_id": self._pick_session_id()})
+            for start in sorted(self._state.function_starts):
+                query = {
+                    "session_id": self._pick_session_id(),
+                    "address" if addressed_il else "function_start": start,
+                    "level": "llil"
+                    if tool_name == "value.flags_at"
+                    else arguments.get("level", "mlil"),
+                    "ssa": arguments.get("ssa", False) or tool_name.startswith("function.ssa_"),
+                }
+                if not addressed_il:
+                    query["limit"] = 1
+                error, il, _ = self._client.call_tool(
+                    "binary.get_function_il_at" if addressed_il else "il.function", query
+                )
+                if not error and il.get("items"):
+                    if "function_start" in arguments:
+                        arguments["function_start"] = start
+                    if "address" in arguments:
+                        arguments["address"] = start if addressed_il else il["items"][0]["address"]
+                    break
+        if "variable_name" in arguments and "function_start" in arguments:
+            for start in sorted(self._state.function_starts):
+                if tool_name == "function.ssa_var_def_use":
+                    error, il, _ = self._client.call_tool(
+                        "il.function",
+                        {
+                            "session_id": self._pick_session_id(),
+                            "function_start": start,
+                            "level": arguments.get("level", "mlil"),
+                            "ssa": True,
+                            "limit": 1,
+                        },
+                    )
+                    if error or not il.get("items"):
+                        continue
+                error, variables, _ = self._client.call_tool(
+                    "function.variables",
+                    {
+                        "session_id": self._pick_session_id(),
+                        "function_start": start,
+                    },
+                )
+                candidates = variables.get("items", []) if not error else []
+                if tool_name in {"uidf.set_user_var_value", "uidf.clear_user_var_value"}:
+                    # Native API defines parameters (index 0) at the function entry.
+                    # Other variables require an actual MLIL definition-site address.
+                    candidates = [var for var in candidates if var.get("index") == 0]
+                if candidates:
+                    arguments["function_start"] = start
+                    if "def_addr" in properties:
+                        arguments["def_addr"] = start
+                    arguments["variable_name"] = candidates[0]["name"]
+                    break
+        if tool_name == "uidf.clear_user_var_value":
+            # Clear an actual value we set at the same definition site.
+            self._invoke(
+                "uidf.set_user_var_value", {**arguments, "value": "0x2a", "state": "ConstantValue"}
+            )
 
         if tool_name == "disasm.function":
             has_function_start = "function_start" in arguments
@@ -804,7 +1040,7 @@ class McpFeatureFuzzer:
         if key == "base_address":
             return self._pick_end_address()
 
-        if key == "register":
+        if key == "register" and "boolean" not in self._schema_types(schema):
             return self._pick_one(self._state.register_names, "x0")
 
         if key == "variable_name":
@@ -962,6 +1198,8 @@ class McpFeatureFuzzer:
         return _MISSING
 
     def _value_for_value_field(self, tool_name: str, schema: Any) -> Any:
+        if tool_name in {"uidf.parse_possible_value", "uidf.set_user_var_value"}:
+            return "0x2a"
         types = self._schema_types(schema)
         if "integer" in types:
             return 42
@@ -969,8 +1207,6 @@ class McpFeatureFuzzer:
             return "fuzz-value"
         if tool_name in {"project.metadata_store", "metadata.store", "function.metadata_store"}:
             return {"fuzz": True, "n": 1}
-        if tool_name in {"uidf.parse_possible_value", "uidf.set_user_var_value"}:
-            return "0x2a"
         return "fuzz-value"
 
     def _fallback_value(  # noqa: PLR0911
@@ -1169,7 +1405,7 @@ class McpFeatureFuzzer:
 
     def _path_for_tool(self, tool_name: str) -> str:  # noqa: PLR0911, PLR0912
         if tool_name == "session.open":
-            return str(self._state.sample_path)
+            return str(self._analysis_database or self._state.sample_path)
 
         if tool_name == "session.open_bytes":
             return str(self._state.sample_path)
@@ -1261,6 +1497,12 @@ class McpFeatureFuzzer:
             )
 
         summary = {
+            "source_hashes": self._source_hashes,
+            "load_options": self._load_options,
+            "used_analysis_database": self._analysis_database is not None,
+            "input_sha256": hashlib.sha256(
+                base64.b64decode(self._state.sample_data_b64)
+            ).hexdigest(),
             "seed": self._seed,
             "iterations": self._iterations,
             "total_tools": len(all_tool_names),
@@ -1274,10 +1516,13 @@ class McpFeatureFuzzer:
             "total_calls": total_calls,
             "successful_calls": successful_calls,
             "error_calls": error_calls,
+            "unexpected_error_calls": error_calls - len(self._unavailable_calls),
+            "unavailable_calls": self._unavailable_calls,
             "call_success_rate": round(100.0 * successful_calls / total_calls, 2)
             if total_calls
             else 0.0,
             "unattempted_tools": unattempted,
+            "excluded_external_actions": sorted(EXTERNAL_ACTION_TOOLS),
             "failed_tools": failed_tools,
         }
 
@@ -1317,6 +1562,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=1337, help="RNG seed")
     parser.add_argument(
+        "--load-options",
+        type=json.loads,
+        default={},
+        help="JSON object of explicit Binary Ninja load/analysis options",
+    )
+    parser.add_argument(
         "--fake-backend",
         action="store_true",
         help="Use fake backend instead of real binaryninja module",
@@ -1326,7 +1577,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Pass update_analysis=true on session.open",
     )
+    parser.add_argument(
+        "--analysis-database",
+        type=Path,
+        help="Reuse a completed analysis in a private copy; probe raw bytes without analysis",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print each tool call as it runs")
+    parser.add_argument("--trace-jsonl", help="Incremental request/response trace path")
+    parser.add_argument(
+        "--allow-tool-errors",
+        action="store_true",
+        help="Exploratory sweep only: allow reported tool errors in the exit code",
+    )
     parser.add_argument(
         "--report-json",
         help="Optional path to write machine-readable summary JSON",
@@ -1343,6 +1605,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not isinstance(args.load_options, dict):
+        parser.error("--load-options must be a JSON object")
 
     binary_path = Path(args.binary).resolve()
     if not binary_path.exists():
@@ -1358,13 +1622,17 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         update_analysis=args.update_analysis,
         verbose=args.verbose,
+        trace_path=Path(args.trace_jsonl) if args.trace_jsonl else None,
+        load_options=args.load_options,
+        analysis_database=args.analysis_database,
     )
 
     try:
         summary = fuzzer.run()
     finally:
-        fuzzer.close()
+        # Retain the work directory if shutdown cannot drain native users of it.
         backend.shutdown()
+        fuzzer.close()
 
     if args.report_json:
         report_path = Path(args.report_json)
@@ -1378,6 +1646,9 @@ def main(argv: list[str] | None = None) -> int:
             f"successful_tools={summary['successful_tools']} "
             f"< min_success_tools={min_success_tools}"
         )
+        return 1
+
+    if summary["unexpected_error_calls"] and not args.allow_tool_errors:
         return 1
 
     return 0
