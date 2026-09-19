@@ -108,10 +108,10 @@ def test_backend_advanced_types_debug_workflow_il_uidf(  # noqa: PLR0915
         == type_archive_id
     )
 
-    pulled = real_backend.type_archive_pull(session_id, type_archive_id, ["mcp_lib_type"])
-    assert "pulled" in pulled
     pushed = real_backend.type_archive_push(session_id, type_archive_id, ["mcp_lib_type"])
     assert "pushed" in pushed
+    pulled = real_backend.type_archive_pull(session_id, type_archive_id, ["mcp_lib_type"])
+    assert "pulled" in pulled
     listed_after_push = real_backend.type_archive_list(session_id)
     json.dumps(listed_after_push)
     assert all(

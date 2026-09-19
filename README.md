@@ -18,6 +18,8 @@ The goal is an interface where agents can inspect, refine, and extend an analysi
 - **Read-only by default** with safe mutation workflows (undo/redo, transactions).
 - **Scripting access** via `binja.eval` and `binja.call` for anything the tool catalog doesn't cover.
 - **Stdio and TCP transports.**
+- **Complete command-line client** (`binja_cli` / `binja-cli`) with schema-derived
+  flags, JSON batches, offline discovery, and managed persistent servers.
 - **Zero runtime dependencies** beyond Binary Ninja itself.
 - **Fake backend mode** for CI and development without a Binary Ninja license.
 
@@ -42,6 +44,30 @@ pip install git+https://github.com/mrphrazer/binary-ninja-headless-mcp.git
 ```
 
 ## Quick Start
+
+### Command-line client
+
+The CLI exposes every MCP tool through the same backend. Its usage follows
+Ghidra's `ghidra_cli`. See the [complete CLI guide and generated tool reference](BINJA_CLI.md)
+for arguments, defaults, sessions, batches, scripting, output, and troubleshooting.
+
+```bash
+binja_cli list --names-only             # Works without Binary Ninja
+binja_cli describe session.open
+binja_cli server start                  # Requires licensed Binary Ninja
+SID=$(binja_cli --field session_id call session.open --path /bin/ls)
+binja_cli --session-id "$SID" call binary.functions --limit 5
+binja_cli call session.close --session-id "$SID"
+binja_cli server stop
+```
+
+Use `python3 -m binary_ninja_headless_mcp.binja_cli` from a source checkout.
+For a license-free client check, run `binja_cli --fake-backend call health.ping`.
+Managed sessions persist across commands; in-process sessions last one invocation.
+The managed default is `127.0.0.1:8766`. TCP exposes powerful analysis and Python
+execution capabilities without authentication; keep it accessible only to trusted clients.
+
+### MCP server
 
 Stdio transport (default):
 
@@ -143,6 +169,11 @@ Tool call response behavior:
 ## Quality And Testing
 
 This repository is well tested and has enforced quality gates.
+
+The [CLI verification report](CLI_VERIFICATION.md) records native coverage of all
+181 tools across both architectures, transports, and argument styles, along with
+reproduction commands, installed-package checks, lifecycle evidence, and tested
+runtime boundaries. The [CLI guide](BINJA_CLI.md) documents everyday usage.
 
 - Test suite: run `pytest --collect-only -q` for the current collected test count.
 - CI workflow enforces:

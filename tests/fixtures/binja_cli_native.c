@@ -1,0 +1,1 @@
+../../binary_ninja_headless_mcp/fixtures/binja_cli_native.c

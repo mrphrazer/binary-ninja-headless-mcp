@@ -41,6 +41,7 @@ class BinjaBackend(LifecycleMixin):
         self._type_archives: dict[str, Any] = {}
         self._projects: dict[str, Any] = {}
         self._base_detectors: dict[str, Any] = {}
+        self._workflow_clones: dict[tuple[str, str], Any] = {}
         self._init_lifecycle()
 
     def ping(self) -> dict[str, str]:
@@ -200,7 +201,12 @@ class BinjaBackend(LifecycleMixin):
         }
 
     def close_session(self, session_id: str) -> dict[str, Any]:
-        return self._close_session(session_id, time.monotonic() + lifecycle.CLOSE_DRAIN_TIMEOUT_S)
+        result = self._close_session(session_id, time.monotonic() + lifecycle.CLOSE_DRAIN_TIMEOUT_S)
+        with self._lock:
+            for key in list(self._workflow_clones):
+                if key[0] == session_id:
+                    del self._workflow_clones[key]
+        return result
 
     def _load_view(
         self,
@@ -210,7 +216,20 @@ class BinjaBackend(LifecycleMixin):
         options: dict[str, Any],
     ) -> Any:
         try:
-            view = self._bn.load(path, update_analysis=update_analysis, options=options)
+            source = path
+            with self._lock:
+                projects = tuple(self._projects.values())
+            for project in projects:
+                lookup = getattr(project, "get_file_by_path_on_disk", None)
+                if not callable(lookup):
+                    continue
+                project_file = lookup(path)
+                if project_file is not None and project_file.path_on_disk == path:
+                    # Passing the actual managed ProjectFile lets the native loader
+                    # establish project context; filename loading cannot do that.
+                    source = project_file
+                    break
+            view = self._bn.load(source, update_analysis=update_analysis, options=options)
         except Exception as exc:  # pragma: no cover - depends on binaryninja internals
             raise BinjaBackendError(f"failed to load binary: {exc}") from exc
 
@@ -2822,8 +2841,8 @@ class BinjaBackend(LifecycleMixin):
         except Exception as exc:
             raise BinjaBackendError(f"failed to import library object: {exc}") from exc
 
-        library_name = None
-        imported_type = None
+        library_name = self._safe_attr(library, "name")
+        imported_type = imported
         if isinstance(imported, tuple) and len(imported) == 2:
             library_name = self._safe_attr(imported[0], "name")
             imported_type = imported[1]
@@ -3092,6 +3111,10 @@ class BinjaBackend(LifecycleMixin):
         except Exception as exc:
             raise BinjaBackendError(f"failed to pull types from archive: {exc}") from exc
 
+        if pulled is None:
+            raise BinjaBackendError(
+                "failed to pull types from archive: unknown type or native failure"
+            )
         return {
             "session_id": session_id,
             "type_archive_id": type_archive_id,
@@ -3121,6 +3144,10 @@ class BinjaBackend(LifecycleMixin):
         except Exception as exc:
             raise BinjaBackendError(f"failed to push types to archive: {exc}") from exc
 
+        if pushed is None:
+            raise BinjaBackendError(
+                "failed to push types to archive: unknown type or native failure"
+            )
         return {
             "session_id": session_id,
             "type_archive_id": type_archive_id,
@@ -3140,10 +3167,13 @@ class BinjaBackend(LifecycleMixin):
 
         archive = self._get_type_archive(type_archive_id)
         try:
-            outgoing_direct = archive.get_outgoing_direct_references(name)
-            outgoing_recursive = archive.get_outgoing_recursive_references(name)
-            incoming_direct = archive.get_incoming_direct_references(name)
-            incoming_recursive = archive.get_incoming_recursive_references(name)
+            type_id = archive.get_type_id(name)
+            if type_id is None:
+                raise BinjaBackendError(f"unknown archive type: {name}")
+            outgoing_direct = archive.get_outgoing_direct_references(type_id)
+            outgoing_recursive = archive.get_outgoing_recursive_references(type_id)
+            incoming_direct = archive.get_incoming_direct_references(type_id)
+            incoming_recursive = archive.get_incoming_recursive_references(type_id)
         except Exception as exc:
             raise BinjaBackendError(f"failed to query type archive references: {exc}") from exc
 
@@ -3170,7 +3200,7 @@ class BinjaBackend(LifecycleMixin):
 
         return {"session_id": session_id, "count": len(items), "items": items}
 
-    def debug_parse_and_apply(  # noqa: PLR0912
+    def debug_parse_and_apply(
         self,
         session_id: str,
         *,
@@ -3183,25 +3213,6 @@ class BinjaBackend(LifecycleMixin):
         )
         view = self._get_view(session_id)
 
-        try:
-            parsers = list(self._bn.DebugInfoParser.get_parsers_for_view(view))
-        except Exception as exc:
-            raise BinjaBackendError(f"failed to enumerate debug parsers: {exc}") from exc
-
-        if not parsers:
-            raise BinjaBackendError("no debug info parser is available for this view")
-
-        parser = None
-        if parser_name is None:
-            parser = parsers[0]
-        else:
-            for candidate in parsers:
-                if self._safe_attr(candidate, "name") == parser_name:
-                    parser = candidate
-                    break
-        if parser is None:
-            raise BinjaBackendError(f"debug parser not found: {parser_name}")
-
         parse_path = debug_path or self._safe_attr_chain(view, "file.filename")
         if not parse_path:
             raise BinjaBackendError("debug_path is required when session has no filename")
@@ -3209,6 +3220,27 @@ class BinjaBackend(LifecycleMixin):
         debug_view = None
         try:
             debug_view = self._bn.load(parse_path, update_analysis=False)
+            if debug_view is None:
+                raise BinjaBackendError("failed to load debug information file")
+            # External parsers identify the debug file, which may contain sections
+            # deliberately removed from the target executable (for example DWARF).
+            parser_view = debug_view if debug_path else view
+            try:
+                parsers = list(self._bn.DebugInfoParser.get_parsers_for_view(parser_view))
+            except Exception as exc:
+                raise BinjaBackendError(f"failed to enumerate debug parsers: {exc}") from exc
+            if not parsers:
+                raise BinjaBackendError("no debug info parser is available for this view")
+            parser = next(
+                (
+                    candidate
+                    for candidate in parsers
+                    if parser_name is None or self._safe_attr(candidate, "name") == parser_name
+                ),
+                None,
+            )
+            if parser is None:
+                raise BinjaBackendError(f"debug parser not found: {parser_name}")
             debug_info = parser.parse_debug_info(view, debug_view)
             if debug_info is None:
                 raise BinjaBackendError("debug parser returned no debug info")
@@ -3299,11 +3331,13 @@ class BinjaBackend(LifecycleMixin):
 
         try:
             cloned = workflow.clone(name)
-            if register:
-                cloned.register()
+            if register and not cloned.register():
+                raise BinjaBackendError(f"failed to register workflow: {name}")
         except Exception as exc:
             raise BinjaBackendError(f"failed to clone workflow: {exc}") from exc
 
+        with self._lock:
+            self._workflow_clones[(session_id, name)] = cloned
         return {
             "session_id": session_id,
             "source_workflow": self._safe_attr(workflow, "name"),
@@ -3449,7 +3483,7 @@ class BinjaBackend(LifecycleMixin):
                 enable=enable,
             )
 
-    def _workflow_machine_control(  # noqa: PLR0912
+    def _workflow_machine_control(  # noqa: PLR0912, PLR0915
         self,
         session_id: str,
         action: str,
@@ -3499,27 +3533,27 @@ class BinjaBackend(LifecycleMixin):
                 self._note_initial_interruption(record)
         try:
             if normalized_action == "run":
-                machine.run(advanced=advanced, incremental=incremental)
+                command_result = machine.run(advanced=advanced, incremental=incremental)
             elif normalized_action == "resume":
-                machine.resume(advanced=advanced, incremental=incremental)
+                command_result = machine.resume(advanced=advanced, incremental=incremental)
             elif normalized_action == "halt":
-                machine.halt()
+                command_result = machine.halt()
             elif normalized_action == "reset":
-                machine.reset()
+                command_result = machine.reset()
             elif normalized_action == "enable":
-                machine.enable()
+                command_result = machine.enable()
             elif normalized_action == "disable":
-                machine.disable()
+                command_result = machine.disable()
             elif normalized_action == "dump":
-                _ = machine.dump()
+                command_result = machine.dump()
             elif normalized_action == "breakpoint_set":
-                machine.breakpoint_set(activities or [])
+                command_result = machine.breakpoint_set(activities or [])
             elif normalized_action == "breakpoint_delete":
-                machine.breakpoint_delete(activities or [])
+                command_result = machine.breakpoint_delete(activities or [])
             elif normalized_action == "override_set":
-                machine.override_set(activity, enable)
+                command_result = machine.override_set(activity, enable)
             elif normalized_action == "override_clear":
-                machine.override_clear(activity)
+                command_result = machine.override_clear(activity)
         except BinjaBackendError:
             raise
         except Exception as exc:
@@ -3527,7 +3561,58 @@ class BinjaBackend(LifecycleMixin):
                 f"failed to run workflow machine action '{action}': {exc}"
             ) from exc
 
-        return self.workflow_machine_status(session_id, workflow_name=workflow_name)
+        rejected = (
+            isinstance(command_result, dict)
+            and isinstance(command_result.get("commandStatus"), dict)
+            and command_result["commandStatus"].get("accepted") is False
+        )
+        dump_snapshot = None
+        if rejected:
+            if normalized_action != "dump":
+                raise BinjaBackendError(
+                    f"workflow machine rejected action '{action}': {command_result}"
+                )
+            # Some native versions expose dump() but reject that request in every
+            # machine state. Preserve that response and provide an explicit dump
+            # of independently queried native state, never fabricated acceptance.
+            dump_snapshot = self._workflow_dump_snapshot(workflow, machine, command_result)
+        response = self.workflow_machine_status(session_id, workflow_name=workflow_name)
+        response["command_result"] = self._to_jsonable(command_result)
+        if normalized_action == "dump":
+            response["dump_source"] = (
+                "native_state_snapshot" if dump_snapshot is not None else "native_command"
+            )
+            if dump_snapshot is not None:
+                response["dump_snapshot"] = dump_snapshot
+        return response
+
+    def _workflow_dump_snapshot(
+        self, workflow: Any, machine: Any, rejected_command: Any
+    ) -> dict[str, Any]:
+        snapshot = {}
+        try:
+            for name, method in (
+                ("status", "status"),
+                ("breakpoints", "breakpoint_query"),
+                ("overrides", "override_query"),
+            ):
+                result = getattr(machine, method)()
+                if (
+                    not isinstance(result, dict)
+                    or not isinstance(result.get("commandStatus"), dict)
+                    or result["commandStatus"].get("accepted") is not True
+                ):
+                    raise BinjaBackendError(
+                        f"native {method} did not accept snapshot query: {result}"
+                    )
+                snapshot[name] = self._to_jsonable(result)
+            snapshot["configuration"] = workflow.configuration()
+        except Exception as exc:
+            raise BinjaBackendError(
+                f"workflow dump rejected and state snapshot failed: {exc}; "
+                f"native dump response: {rejected_command}"
+            ) from exc
+        return snapshot
 
     def il_rewrite_capabilities(
         self,
@@ -3610,7 +3695,10 @@ class BinjaBackend(LifecycleMixin):
             raise BinjaBackendError(f"translate is not available for IL level '{level}'")
 
         try:
-            translated = il.translate(lambda _il, _block, instruction: instruction.expr_index)
+            translated = il.translate(
+                lambda destination, _block, instruction: instruction.copy_to(destination)
+            )
+            translated.finalize()
             translated_count = self._iter_count(self._safe_attr(translated, "instructions"))
         except Exception as exc:
             raise BinjaBackendError(f"failed to translate IL: {exc}") from exc
@@ -4671,21 +4759,71 @@ class BinjaBackend(LifecycleMixin):
 
         view = self._get_view(session_id)
         try:
-            context = self._bn.PluginCommandContext(view)
-            if address is not None:
-                context.address = self._coerce_address(address, "address")
-            if length > 0:
-                context.length = length
+            context = self._plugin_command_context(view, command, address, length)
+            is_valid = getattr(command, "is_valid", None)
+            if callable(is_valid) and not is_valid(context):
+                raise BinjaBackendError(f"invalid context for plugin command: {name}")
             result = command.execute(context)
+            if result is False:
+                raise BinjaBackendError(f"plugin command reported failure: {name}")
         except Exception as exc:
             raise BinjaBackendError(f"failed to execute plugin command '{name}': {exc}") from exc
 
         return {
             "session_id": session_id,
             "name": name,
-            "executed": bool(result),
+            "executed": True,
             "dry_run": False,
         }
+
+    def _plugin_command_context(
+        self, view: Any, command: Any, address: int | str | None, length: int
+    ) -> Any:
+        """Build native function/IL contexts from the public address selection."""
+        if length < 0:
+            raise BinjaBackendError("length must be non-negative")
+        context = self._bn.PluginCommandContext(view)
+        if address is not None:
+            context.address = self._coerce_address(address, "address")
+        context.length = length
+        command_type = self._enum_name_or_value(self._safe_attr(command, "type"))
+        if command_type == "ProjectPluginCommand":
+            project = context.project
+            if project is not None and not hasattr(project, "handle"):
+                # Binary Ninja 6.0 Project stores _handle, while its own plugin
+                # dispatcher accesses handle. Alias only this genuine native
+                # object; do not mutate the native class or fabricate context.
+                project.handle = project._handle
+        if not isinstance(command_type, str) or address is None:
+            return context
+        if command_type == "FunctionPluginCommand":
+            context.function = self._find_function_containing(view, context.address)
+        for prefix, level in (
+            ("LowLevelIL", "llil"),
+            ("MediumLevelIL", "mlil"),
+            ("HighLevelIL", "hlil"),
+        ):
+            if command_type not in {
+                prefix + "FunctionPluginCommand",
+                prefix + "InstructionPluginCommand",
+            }:
+                continue
+            function = self._find_function_containing(view, context.address)
+            if function is None:
+                break
+            il = self._get_il_function(function, level, ssa=False)
+            context.function = il
+            if command_type.endswith("InstructionPluginCommand"):
+                context.instruction = next(
+                    (
+                        instruction
+                        for instruction in il.instructions
+                        if instruction.address == context.address
+                    ),
+                    None,
+                )
+            break
+        return context
 
     def plugin_repo_status(self) -> dict[str, Any]:
         manager = self._bn.RepositoryManager()
@@ -4713,6 +4851,8 @@ class BinjaBackend(LifecycleMixin):
                         "name": self._safe_attr(plugin, "name"),
                         "installed": bool(self._safe_attr(plugin, "installed")),
                         "enabled": bool(self._safe_attr(plugin, "enabled")),
+                        "disable_pending": bool(self._safe_attr(plugin, "disable_pending")),
+                        "delete_pending": bool(self._safe_attr(plugin, "delete_pending")),
                     }
                 )
 
@@ -4798,7 +4938,13 @@ class BinjaBackend(LifecycleMixin):
                 if callable(disable_method):
                     changed = bool(disable_method())
                 else:
-                    raise BinjaBackendError("disable is not supported for this plugin instance")
+                    was_enabled = bool(plugin.enabled)
+                    plugin.enabled = False
+                    if plugin.enabled:
+                        raise BinjaBackendError(
+                            "native plugin disable did not change enabled state"
+                        )
+                    changed = was_enabled
             else:
                 raise BinjaBackendError(
                     "action must be one of: install, uninstall, enable, disable"
@@ -4817,6 +4963,8 @@ class BinjaBackend(LifecycleMixin):
             "changed": changed,
             "installed": bool(self._safe_attr(plugin, "installed")),
             "enabled": bool(self._safe_attr(plugin, "enabled")),
+            "disable_pending": bool(self._safe_attr(plugin, "disable_pending")),
+            "delete_pending": bool(self._safe_attr(plugin, "delete_pending")),
         }
 
     def base_address_detect(
@@ -4824,6 +4972,7 @@ class BinjaBackend(LifecycleMixin):
         session_id: str,
         *,
         arch_name: str | None = None,
+        algorithm: str = "instruction",
         analysis: str = "full",
         min_strlen: int = 10,
         alignment: int = 1024,
@@ -4831,23 +4980,47 @@ class BinjaBackend(LifecycleMixin):
         high_boundary: int = 0xFFFFFFFFFFFFFFFF,
         max_pointers: int = 128,
     ) -> dict[str, Any]:
+        if algorithm not in {"instruction", "sampling"}:
+            raise BinjaBackendError("algorithm must be instruction or sampling")
+        if algorithm == "sampling" and (
+            analysis != "full" or alignment != 1024 or max_pointers != 128
+        ):
+            raise BinjaBackendError(
+                "sampling does not support analysis, alignment, or max_pointers overrides; "
+                "omit these instruction-only options"
+            )
         view = self._get_view(session_id)
         detector = self._bn.BaseAddressDetection(view)
         self._base_detectors[session_id] = detector
 
         arch = arch_name if arch_name is None else self._resolve_arch(session_id, arch_name)
         try:
-            detected = bool(
-                detector.detect_base_address(
-                    arch=arch,
-                    analysis=analysis,
-                    min_strlen=min_strlen,
-                    alignment=alignment,
-                    low_boundary=low_boundary,
-                    high_boundary=high_boundary,
-                    max_pointers=max_pointers,
+            if algorithm == "sampling":
+                sample = getattr(detector, "detect_base_address_with_sampling", None)
+                if not callable(sample):
+                    raise BinjaBackendError(
+                        "sampling base detection is unavailable in this Binary Ninja version"
+                    )
+                detected = bool(
+                    sample(
+                        arch=arch,
+                        min_strlen=min_strlen,
+                        low_boundary=low_boundary,
+                        high_boundary=high_boundary,
+                    )
                 )
-            )
+            else:
+                detected = bool(
+                    detector.detect_base_address(
+                        arch=arch,
+                        analysis=analysis,
+                        min_strlen=min_strlen,
+                        alignment=alignment,
+                        low_boundary=low_boundary,
+                        high_boundary=high_boundary,
+                        max_pointers=max_pointers,
+                    )
+                )
         except Exception as exc:
             raise BinjaBackendError(f"failed to detect base address: {exc}") from exc
 
@@ -4861,6 +5034,7 @@ class BinjaBackend(LifecycleMixin):
         return {
             "session_id": session_id,
             "detected": detected,
+            "algorithm": algorithm,
             "confidence": self._safe_attr(detector, "confidence"),
             "preferred_base_address": self._hex_or_none(
                 self._safe_attr(detector, "preferred_base_address")
@@ -4925,6 +5099,7 @@ class BinjaBackend(LifecycleMixin):
 
     def shutdown(self) -> None:
         self._shutdown()
+        self._workflow_clones.clear()
 
     def _resolve_call_target(self, target: str, session_id: str | None) -> tuple[Any, str]:
         if target.startswith("bn."):
@@ -5012,6 +5187,10 @@ class BinjaBackend(LifecycleMixin):
                 raise BinjaBackendError("view has no workflow")
             return workflow
 
+        with self._lock:
+            cloned = self._workflow_clones.get((session_id, workflow_name))
+        if cloned is not None:
+            return cloned
         current = self._safe_attr(view, "workflow")
         if self._safe_attr(current, "name") == workflow_name:
             return current
@@ -5204,7 +5383,8 @@ class BinjaBackend(LifecycleMixin):
             "source_symbol": self._safe_attr_chain(location, "source_symbol.full_name"),
             "target_symbol": self._safe_attr(location, "target_symbol"),
             "target_address": self._hex_or_none(self._safe_attr(location, "target_address")),
-            "external_library": self._safe_attr_chain(location, "external_library.name"),
+            "external_library": self._safe_attr_chain(location, "library.name")
+            or self._safe_attr_chain(location, "external_library.name"),
             "auto_defined": bool(self._safe_attr(location, "auto_defined")),
         }
 
@@ -5496,12 +5676,16 @@ class BinjaBackend(LifecycleMixin):
 
     def _variable_reference_source_to_record(self, reference: Any) -> dict[str, Any]:
         variable = self._safe_attr(reference, "var")
-        function = self._safe_attr(reference, "func")
+        source = self._safe_attr(reference, "src") or reference
+        function = self._safe_attr(source, "func")
+        reference_type = self._safe_attr(source, "type")
+        if reference_type is None:
+            reference_type = self._safe_attr(source, "il_type")
         return {
-            "address": self._hex_or_none(self._safe_attr(reference, "address")),
-            "arch": self._safe_attr_chain(reference, "arch.name"),
+            "address": self._hex_or_none(self._safe_attr(source, "address")),
+            "arch": self._safe_attr_chain(source, "arch.name"),
             "function_start": self._hex_or_none(self._safe_attr(function, "start")),
-            "type": self._enum_name_or_value(self._safe_attr(reference, "type")),
+            "type": self._enum_name_or_value(reference_type),
             "variable": self._variable_to_record(variable) if variable is not None else None,
         }
 

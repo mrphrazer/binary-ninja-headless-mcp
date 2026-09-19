@@ -870,6 +870,28 @@ class McpFeatureFuzzer:
         if tool_name.startswith("workflow.machine."):
             # A cloned definition has no machine; control the session's bound workflow.
             arguments.pop("workflow_name", None)
+        if tool_name in {"type_archive.push", "type_archive.pull", "type_archive.references"}:
+            # A fresh archive is empty, and earlier rename/undefine calls can make
+            # cached names stale. Establish an actual type and archive entry.
+            archive_type = "mcp_fuzz_archive_type"
+            session_id = self._pick_session_id()
+            self._invoke(
+                "type.define_user",
+                {"session_id": session_id, "name": archive_type, "type_source": "int"},
+            )
+            if tool_name == "type_archive.references":
+                arguments["name"] = archive_type
+            else:
+                arguments["names"] = [archive_type]
+            if tool_name != "type_archive.push":
+                self._invoke(
+                    "type_archive.push",
+                    {
+                        "session_id": session_id,
+                        "type_archive_id": arguments["type_archive_id"],
+                        "names": [archive_type],
+                    },
+                )
         if tool_name == "transform.inspect":
             arguments.setdefault("session_id", self._pick_session_id())
         if tool_name.startswith("value.") and "function_start" in arguments:
@@ -1125,7 +1147,7 @@ class McpFeatureFuzzer:
             return 1
 
         if key == "action" and tool_name == "workflow.machine.control":
-            return "dump"
+            return "enable"
 
         if key == "activities":
             activity = self._pick_activity()

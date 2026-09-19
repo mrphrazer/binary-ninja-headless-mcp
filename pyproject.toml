@@ -22,6 +22,8 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
+binja_cli = "binary_ninja_headless_mcp.binja_cli:main"
+binja-cli = "binary_ninja_headless_mcp.binja_cli:main"
 binary_ninja_headless_mcp = "binary_ninja_headless_mcp.cli:main"
 binary-ninja-headless-mcp = "binary_ninja_headless_mcp.cli:main"
 
@@ -32,6 +34,9 @@ Issues = "https://github.com/mrphrazer/binary-ninja-headless-mcp/issues"
 
 [tool.setuptools]
 packages = ["binary_ninja_headless_mcp"]
+
+[tool.setuptools.package-data]
+binary_ninja_headless_mcp = ["fixtures/*.c"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

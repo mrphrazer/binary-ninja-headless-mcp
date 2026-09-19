@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+from binary_ninja_headless_mcp.catalog import TOOL_DEFINITIONS
+
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_PATH = ROOT / "binary_ninja_headless_mcp" / "server.py"
 BACKEND_PATH = ROOT / "binary_ninja_headless_mcp" / "backend.py"
@@ -54,27 +56,6 @@ def _tool_handlers(server_methods: dict[str, ast.FunctionDef]) -> dict[str, str]
     return handlers
 
 
-def _tool_definitions(server_methods: dict[str, ast.FunctionDef]) -> set[str]:
-    defs = set()
-    for call in ast.walk(server_methods["_tool_definitions"]):
-        if not isinstance(call, ast.Call):
-            continue
-        if not isinstance(call.func, ast.Attribute):
-            continue
-        if not (
-            isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "self"
-            and call.func.attr == "_tool"
-        ):
-            continue
-        if not call.args:
-            continue
-        first_arg = call.args[0]
-        if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
-            defs.add(first_arg.value)
-    return defs
-
-
 def _backend_calls_from_tool_methods(server_methods: dict[str, ast.FunctionDef]) -> set[str]:
     calls = set()
     for name, method in server_methods.items():
@@ -104,7 +85,7 @@ def test_tool_registry_and_definitions_match() -> None:
     module = _parse(SERVER_PATH)
     methods = _server_methods(_server_class(module))
     handlers = set(_tool_handlers(methods))
-    definitions = _tool_definitions(methods)
+    definitions = {spec["name"] for spec in TOOL_DEFINITIONS}
     assert handlers == definitions
 
 
@@ -124,20 +105,6 @@ def test_tool_handlers_map_to_backend_methods_without_dead_public_api() -> None:
     assert not dead_backend_methods, "backend public methods not reachable by tools: " + ", ".join(
         dead_backend_methods
     )
-
-
-def _ast_to_value(node: ast.AST) -> object:
-    if isinstance(node, ast.Constant):
-        return node.value
-    if isinstance(node, ast.List):
-        return [_ast_to_value(e) for e in node.elts]
-    if isinstance(node, ast.Dict):
-        out: dict[object, object] = {}
-        for k, v in zip(node.keys, node.values, strict=True):
-            if isinstance(k, ast.Constant):
-                out[k.value] = _ast_to_value(v)
-        return out
-    return None
 
 
 def _array_without_items(schema: object, path: str, issues: list[str]) -> None:
@@ -173,19 +140,7 @@ def _array_without_items(schema: object, path: str, issues: list[str]) -> None:
 
 def test_array_schemas_declare_items() -> None:
     """Strict JSON Schema clients (Vercel AI SDK, etc.) reject array schemas without `items`."""
-    methods = _server_methods(_server_class(_parse(SERVER_PATH)))
     issues: list[str] = []
-    for call in ast.walk(methods["_tool_definitions"]):
-        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
-            continue
-        if call.func.attr != "_tool":
-            continue
-        if len(call.args) < 3 or not isinstance(call.args[2], ast.Dict):
-            continue
-        first = call.args[0]
-        tool_name = first.value if isinstance(first, ast.Constant) else "<?>"
-        for prop_key, prop_val in zip(call.args[2].keys, call.args[2].values, strict=True):
-            if not (isinstance(prop_key, ast.Constant) and isinstance(prop_val, ast.Dict)):
-                continue
-            _array_without_items(_ast_to_value(prop_val), f"{tool_name}.{prop_key.value}", issues)
+    for spec in TOOL_DEFINITIONS:
+        _array_without_items(spec["inputSchema"], spec["name"], issues)
     assert not issues, "array schemas missing 'items': " + ", ".join(issues)
